@@ -1,6 +1,6 @@
 {
   "name": "pi-quota-watch",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Show ChatGPT (Codex) and Grok (xAI) subscription quota inside pi and pi-web: 5h/7d usage windows, reset countdown, credits, rate-limit headroom",
   "type": "module",
   "license": "MIT",

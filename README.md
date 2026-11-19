@@ -2,52 +2,23 @@
 
 在 **pi**（终端 TUI）和 **pi-web**（浏览器 UI）里显示 ChatGPT / Grok 订阅额度的 pi 插件。
 
-```
-⚠ GPT 5h 剩76% · 7d 剩9% (1d 5h 后重置)  |  Grok SuperGrok · 今日 6.6k tok   [订阅额度]
-```
-
-- **ChatGPT（Codex 订阅）**：5 小时窗口 / 7 天窗口的剩余百分比、重置倒计时、credits、重置券数量
-- **Grok（SuperGrok / X Premium）**：套餐名、Grok Code 权限、限流余量、今日本机用量
-- 零额外成本：额度查询是免费 GET，限流数据从真实请求的响应头被动采集
-- pi-web 里额外提供可点击胶囊（点一下执行 `/quota`）和可展开的明细面板
-
-## 它是什么
-
-不是独立程序，是一个 **pi extension**。pi-web 复用同一个 pi 宿主，所以同一个文件同时给终端和浏览器供 UI。做成 pi package 之后可以用 `pi install` 分发。
-
-## 界面
-
-**pi-web**（输入框上方状态行 + 面板）
+状态行只占 **一颗可点击胶囊**：
 
 ```
-⚠ GPT 5h 剩76% · 7d 剩9% (1d 5h 后重置)  |  Grok SuperGrok · 今日 6.6k tok   订阅额度 ▸
-┌ 额度明细 ────────────────────────────────────────────────────────┐
-│ 订阅额度 · 14:18                                                 │
-│ ChatGPT Plus · 14:17 更新                                        │
-│   5h   ████████░░ 剩76%   1h 16m 后重置 (11/19 15:34)             │
-│   7d   █░░░░░░░░░  剩9%   1d 5h 后重置 (11/20 20:06)             │
-│   credits 0 · 重置券 3                                           │
-│   今日    6 次 · 输入 812k · 输出 21k · 缓存读 640k               │
-│ SuperGrok · Grok Code 可用                                       │
-│   限流  ██████████ 100% 剩   8300/8300 请求                      │
-│   tokens 剩 53.00M / 53.00M                                      │
-│   今日    2 次 · 输入 6.5k · 输出 96 · 缓存读 9.0k                │
-└──────────────────────────────────────────────────────────────────┘
+🔥极限   代理:开   ⚠ GPT 5h 61% · 7d 5%（1d4h） | SuperGrok
 ```
 
-**pi TUI**：同样的内容在页脚状态行，`/quota` 看完整报表。
-
-`/quota` 会在对话里输出 markdown 报表：
+点它（pi-web）= 执行 `/quota`，弹出完整报表：
 
 ```
 ### 订阅额度
 
-**ChatGPT** · Plus　（14:39 更新）
+**ChatGPT** · Plus　（15:15 更新）
 
 | 窗口 | 剩余 | 重置 |
 | --- | --- | --- |
-| 5h | 69% | 55m 后（11/19 15:34） |
-| 7d | 6% | 1d 5h 后（11/20 20:06） |
+| 5h | `█████░░░` 61% | 18m 后（11/19 15:34） |
+| 7d | `░░░░░░░░` 5% | 1d 4h 后（11/20 20:06） |
 
 credits：0 · 重置券：3 张 · 可用模型：gpt-6-astra
 
@@ -57,6 +28,46 @@ credits：0 · 重置券：3 张 · 可用模型：gpt-6-astra
 - 今日本机用量：2 次请求 · 输入 6.5k · 输出 96 · 缓存读 9.0k
 - 说明：xAI 没有公开的订阅剩余额度接口，这里给的是限流余量 + 本机用量。
 ```
+
+- **ChatGPT（Codex 订阅）**：5 小时 / 7 天窗口的剩余百分比、重置倒计时、credits、重置券
+- **Grok（SuperGrok / X Premium）**：套餐名、Grok Code 权限、限流余量、今日本机用量
+- 零额外成本：额度查询是免费 GET，限流数据从真实请求的响应头被动采集
+- 状态行只在快用完（≤15%）时才写重置倒计时，平时极短
+
+## 它是什么
+
+不是独立程序，是一个 **pi extension**。pi-web 复用同一个 pi 宿主，所以同一个文件同时给终端和浏览器供 UI。做成 pi package 之后可以用 `pi install` 分发。
+
+## 界面
+
+**pi-web**：输入框上方状态行里的一颗按钮，文字就是摘要，点击执行 `/quota`。
+
+```
+🔥极限   代理:开   ⚠ GPT 5h 61% · 7d 5%（1d4h） | SuperGrok
+```
+
+**pi TUI**：同样的文字在页脚状态行，`/quota` 看完整报表。
+
+想要**常驻的明细面板**（进度条 + credits + 今日用量，不点也能看），打开：
+
+```bash
+PI_QUOTA_WIDGET=1
+```
+
+```
+┌ 额度明细 ────────────────────────────────────────────────────────┐
+│ 订阅额度 · 15:15                                                 │
+│ ChatGPT Plus · 15:15 更新                                        │
+│   5h   █████░░░░░ 剩61%   18m 后重置 (11/19 15:34)                │
+│   7d   ░░░░░░░░░░  剩5%   1d 4h 后重置 (11/20 20:06)             │
+│   credits 0 · 重置券 3                                           │
+│ SuperGrok · Grok Code 可用                                       │
+│   限流  ██████████ 100% 剩   8300/8300 请求                      │
+│   tokens 剩 53.00M / 53.00M                                      │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+默认关闭，因为状态行已经和你自己的其它扩展（`🔥极限`、`代理:开`…）挤在一起了。
 
 ## 安装
 
@@ -75,15 +86,15 @@ pi install ./pi-quota-watch
 
 安装后**重启 pi-web**（`pi-web stop` 再 `pi-web`），或在会话里执行 `/reload`。
 
-> 同一个插件只能存在一份：如果既装了包又留着手动拷贝的 `~/.pi/agent/extensions/quota-watch.ts`，
-> 命令会变成 `/quota:1`、`/quota:2`，`/quota` 本身反而失效。二选一。
+> **同一个插件只能存在一份。** 如果既装了包又留着手动拷贝的
+> `~/.pi/agent/extensions/quota-watch.ts`，命令会变成 `/quota:1`、`/quota:2`，
+> `/quota` 本身反而失效。二选一。
 
 ## 用法
 
 | 操作 | 结果 |
 | --- | --- |
-| `/quota` | 强制刷新 + 在对话里输出报表 |
-| 点状态行上的「订阅额度」胶囊（pi-web） | 等于执行 `/quota` |
+| 点状态行胶囊（pi-web）/ `/quota` | 强制刷新 + 在对话里输出报表 |
 | 什么都不做 | 会话启动自动渲染，之后每 5 分钟刷新 |
 
 ### 环境变量
@@ -91,6 +102,7 @@ pi install ./pi-quota-watch
 | 变量 | 默认 | 作用 |
 | --- | --- | --- |
 | `PI_QUOTA_DISABLE` | 未设 | `1` = 完全禁用 |
+| `PI_QUOTA_WIDGET` | 未设 | `1` = 额外显示常驻明细面板（默认只有一颗胶囊） |
 | `PI_QUOTA_POLL_MS` | `300000` | 轮询间隔，最小 30000 |
 | `PI_QUOTA_DEBUG` | 未设 | `1` = 抓取细节打到 stderr |
 
@@ -163,16 +175,18 @@ MIT
 **pi-quota-watch** is a [pi](https://github.com/earendil-works/pi) extension / pi package that shows your
 ChatGPT (Codex subscription) and Grok (SuperGrok / X Premium) quota inside **pi** and **pi-web**.
 
+It takes exactly **one status slot**: a clickable chip in pi-web whose label is the summary
+(`⚠ GPT 5h 61% · 7d 5%（1d4h） | SuperGrok`). Clicking it runs `/quota`, which prints a full markdown
+report. Set `PI_QUOTA_WIDGET=1` if you want the always-visible detail panel as well.
+
 - ChatGPT: 5-hour and 7-day windows with remaining percentage, reset countdown, credits and reset-credit count,
   from `GET https://chatgpt.com/backend-api/wham/usage` (the same free endpoint Codex CLI uses).
-- Grok: xAI exposes **no** subscription-quota endpoint (30+ probed paths return 404), so the panel shows
+- Grok: xAI exposes **no** subscription-quota endpoint (30+ probed paths return 404), so the plugin shows
   passive `x-ratelimit-*` headroom collected from real responses, the plan name from the Grok CLI backend,
   and today's local token usage. No invented percentages.
-- Renders as a status line, an expandable text widget and a clickable `/quota` chip in pi-web;
-  the same data shows in the terminal footer.
 
 ```bash
 pi install git:github.com/pisceslailai/pi-quota-watch
 ```
 
-Environment: `PI_QUOTA_DISABLE=1`, `PI_QUOTA_POLL_MS=300000`, `PI_QUOTA_DEBUG=1`.
+Environment: `PI_QUOTA_DISABLE=1`, `PI_QUOTA_WIDGET=1`, `PI_QUOTA_POLL_MS=300000`, `PI_QUOTA_DEBUG=1`.

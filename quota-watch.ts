@@ -44,10 +44,16 @@ import { dirname, join } from "node:path";
 const CHATGPT_PROVIDER = "openai-codex";
 const XAI_PROVIDER = "xai";
 
-const STATUS_KEY = "quota";
-const COMMAND_STATUS_KEY = "command:/quota";
-const COMMAND_STATUS_LABEL = "订阅额度";
+/**
+ * 唯一的状态项：key 以 `command:` 开头，pi-web 会把它渲染成可点击胶囊（点一下执行 /quota）。
+ * 状态文字本身就是摘要，所以这一颗胶囊同时承担「看数」和「点开」两件事。
+ */
+const STATUS_KEY = "command:/quota";
+/** 旧版本用过的 key，升级后顺手清掉，避免残留。 */
+const LEGACY_STATUS_KEYS = ["quota"];
 const WIDGET_KEY = "额度明细";
+/** 明细面板默认关闭（状态行只留一颗胶囊），设 PI_QUOTA_WIDGET=1 打开。 */
+const WIDGET_ENABLED = process.env.PI_QUOTA_WIDGET === "1";
 
 const CHATGPT_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const XAI_USER_URL = "https://cli-chat-proxy.grok.com/v1/user";
@@ -156,6 +162,18 @@ function fmtDuration(seconds?: number): string {
 	const m = Math.floor((s % 3_600) / 60);
 	if (d > 0) return `${d}d ${h}h`;
 	if (h > 0) return `${h}h ${m}m`;
+	return `${m}m`;
+}
+
+/** 状态行用的紧凑写法：1d4h / 3h20m / 45m */
+function fmtDurationShort(seconds?: number): string {
+	if (seconds === undefined || !Number.isFinite(seconds) || seconds < 0) return "—";
+	const totalMinutes = Math.floor(seconds / 60);
+	const d = Math.floor(totalMinutes / 1_440);
+	const h = Math.floor((totalMinutes % 1_440) / 60);
+	const m = totalMinutes % 60;
+	if (d > 0) return `${d}d${h}h`;
+	if (h > 0) return `${h}h${m}m`;
 	return `${m}m`;
 }
 
@@ -407,7 +425,9 @@ function buildStatus(snapshot: Snapshot): string {
 	const parts: string[] = [];
 
 	const chatgpt = snapshot.chatgpt;
+	let hasChatgpt = false;
 	if (chatgpt?.ok && (chatgpt.primary || chatgpt.secondary)) {
+		hasChatgpt = true;
 		const windows = [chatgpt.primary, chatgpt.secondary].filter(
 			(window): window is QuotaWindow => window !== undefined,
 		);
@@ -415,40 +435,33 @@ function buildStatus(snapshot: Snapshot): string {
 			(best, window) => (remainingPercent(window) < remainingPercent(best) ? window : best),
 			windows[0]!,
 		);
-		const bits = windows.map(
-			(window) => `${windowLabel(window.windowSeconds)} 剩${Math.round(remainingPercent(window))}%`,
-		);
 		const low = remainingPercent(tightest);
-		const warn = chatgpt.limitReached || low <= LOW_REMAINING_PERCENT ? "⚠ " : "";
+		const bits = windows.map(
+			(window) => `${windowLabel(window.windowSeconds)} ${Math.round(remainingPercent(window))}%`,
+		);
+		// 只在真的快用完时才占用宽度写重置时间
 		const countdown =
-			low <= 50 && tightest.resetAfterSeconds !== undefined
-				? ` (${fmtDuration(tightest.resetAfterSeconds)} 后重置)`
+			low <= 15 && tightest.resetAfterSeconds !== undefined
+				? `（${fmtDurationShort(tightest.resetAfterSeconds)}）`
 				: "";
+		const warn = chatgpt.limitReached || low <= LOW_REMAINING_PERCENT ? "⚠ " : "";
 		parts.push(`${warn}GPT ${bits.join(" · ")}${countdown}`);
 	} else if (chatgpt && !chatgpt.ok) {
-		parts.push("GPT 额度不可用");
+		parts.push("GPT —");
 	}
 
 	const xai = snapshot.xai;
 	const xaiBucket = usageToday(snapshot, XAI_PROVIDER);
 	if (xai || xaiBucket) {
-		const bits: string[] = [];
-		if (xai?.tier) bits.push(xai.tier);
-		if (
-			xai?.remainingRequests !== undefined &&
-			xai.limitRequests !== undefined &&
-			xai.limitRequests > 0 &&
-			xai.remainingRequests < xai.limitRequests * 0.9
-		) {
-			bits.push(`限流 ${Math.round(xai.remainingRequests)}/${Math.round(xai.limitRequests)}`);
+		const bits = [xai?.tier ?? "Grok"];
+		// 没有 ChatGPT 数据时多给一点信息，否则只留套餐名
+		if (!hasChatgpt && xaiBucket && xaiBucket.requests > 0) {
+			bits.push(`今日 ${fmtTokens(xaiBucket.input + xaiBucket.output)}`);
 		}
-		if (xaiBucket && xaiBucket.requests > 0) {
-			bits.push(`今日 ${fmtTokens(xaiBucket.input + xaiBucket.output)} tok`);
-		}
-		if (bits.length > 0) parts.push(`Grok ${bits.join(" · ")}`);
+		parts.push(bits.join(" · "));
 	}
 
-	return parts.join("  |  ");
+	return parts.join(" | ");
 }
 
 function buildPanel(snapshot: Snapshot): string[] {
@@ -521,9 +534,10 @@ function buildReport(snapshot: Snapshot): string {
 		lines.push("| --- | --- | --- |");
 		for (const window of [chatgpt.primary, chatgpt.secondary]) {
 			if (!window) continue;
+			const remaining = remainingPercent(window);
 			const resetAt = window.resetAt ? fmtDate(window.resetAt * 1000) : "—";
 			lines.push(
-				`| ${windowLabel(window.windowSeconds)} | ${Math.round(remainingPercent(window))}% | ${fmtDuration(window.resetAfterSeconds)} 后（${resetAt}） |`,
+				`| ${windowLabel(window.windowSeconds)} | \`${bar(remaining, 8)}\` ${Math.round(remaining)}% | ${fmtDuration(window.resetAfterSeconds)} 后（${resetAt}） |`,
 			);
 		}
 		lines.push("");
@@ -533,6 +547,12 @@ function buildReport(snapshot: Snapshot): string {
 		if (chatgpt.resetCredits !== undefined) extras.push(`重置券：${chatgpt.resetCredits} 张`);
 		if (chatgpt.models) extras.push(`可用模型：${Object.keys(chatgpt.models).join(", ")}`);
 		if (extras.length > 0) lines.push(extras.join(" · "));
+		const chatgptBucket = usageToday(snapshot, CHATGPT_PROVIDER);
+		if (chatgptBucket && chatgptBucket.requests > 0) {
+			lines.push(
+				`今日本机用量：${chatgptBucket.requests} 次 · 输入 ${fmtTokens(chatgptBucket.input)} · 输出 ${fmtTokens(chatgptBucket.output)} · 缓存读 ${fmtTokens(chatgptBucket.cacheRead)}`,
+			);
+		}
 	} else if (chatgpt) {
 		lines.push(`**ChatGPT**：获取失败 —— ${chatgpt.error ?? "unknown"}`);
 	}
@@ -586,11 +606,10 @@ export default function quotaWatch(pi: ExtensionAPI) {
 	const render = (ctx: ExtensionContext): void => {
 		if (disposed) return;
 		const status = buildStatus(snapshot);
-		const panel = buildPanel(snapshot);
+		const panel = WIDGET_ENABLED ? buildPanel(snapshot) : [];
 		if (status.length === 0 && panel.length === 0) return;
 		try {
-			ctx.ui.setStatus(STATUS_KEY, status);
-			ctx.ui.setStatus(COMMAND_STATUS_KEY, COMMAND_STATUS_LABEL);
+			if (status.length > 0) ctx.ui.setStatus(STATUS_KEY, status);
 			if (panel.length > 0) ctx.ui.setWidget(WIDGET_KEY, panel, { placement: "aboveEditor" });
 		} catch (error) {
 			debug("render failed", errorMessage(error));
@@ -601,7 +620,6 @@ export default function quotaWatch(pi: ExtensionAPI) {
 		if (!ctx) return;
 		try {
 			ctx.ui.setStatus(STATUS_KEY, undefined);
-			ctx.ui.setStatus(COMMAND_STATUS_KEY, undefined);
 			ctx.ui.setWidget(WIDGET_KEY, undefined);
 		} catch {
 			/* session already gone */
@@ -747,6 +765,14 @@ export default function quotaWatch(pi: ExtensionAPI) {
 			if (sessionCtx) void refresh(sessionCtx);
 		}, pollMs);
 		timer.unref?.();
+
+		// 旧版本（或上一次开启 PI_QUOTA_WIDGET）留下的状态项 / 面板先清掉，避免出现两颗胶囊
+		try {
+			for (const key of LEGACY_STATUS_KEYS) ctx.ui.setStatus(key, undefined);
+			if (!WIDGET_ENABLED) ctx.ui.setWidget(WIDGET_KEY, undefined);
+		} catch {
+			/* 非交互客户端忽略 */
+		}
 
 		render(ctx);
 		void refresh(ctx);
