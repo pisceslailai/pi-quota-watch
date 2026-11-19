@@ -22,11 +22,17 @@
 
 credits：0 · 重置券：3 张 · 可用模型：gpt-6-astra
 
-**Grok** · SuperGrok · Grok Code 可用
+**Grok** · SuperGrok · Grok Code 可用　（本期到 11/24 23:21，月付）
 
-- 限流余量：8300/8300 请求，53.00M/53.00M tokens（14:14 采样，窗口长度未知）
-- 今日本机用量：2 次请求 · 输入 6.5k · 输出 96 · 缓存读 9.0k
-- 说明：xAI 没有公开的订阅剩余额度接口，这里给的是限流余量 + 本机用量。
+| 维度 | 剩余 | 上限 | 采样 |
+| --- | --- | --- | --- |
+| 请求 | `████████` 100% | 8,300 | 15:29 |
+| tokens | `████████` 100% | 53.00M | 15:29 |
+
+- 今日本机用量：3 次 · 输入 13.0k · 输出 150 · 缓存读 10.2k（占今日 86%）
+
+- ⚠ 上表的 % 是**限流余量**（xAI 只暴露吞吐上限，实测约 1 分钟内回满），不是「本期还剩多少」——xAI 没有这种接口。
+- 能反映实际使用的只有本机统计，所以额外给了「占今日」比例。
 ```
 
 - **ChatGPT（Codex 订阅）**：5 小时 / 7 天窗口的剩余百分比、重置倒计时、credits、重置券
@@ -125,21 +131,29 @@ Token 通过 `ctx.modelRegistry.getApiKeyForProvider("openai-codex")` 拿，OAut
 
 ### Grok（`xai` 登录）
 
-xAI **没有**公开的订阅剩余额度接口。实测 404 的路径：
+xAI **没有**「本期还剩多少」这种额度接口。实测 404 的路径：
 `api.x.ai/v1/{usage,billing,quota,rate-limits,rate_limits,limits,plan,plans,credits,subscription,subscriptions,team,organization,entitlement}`、
 `cli-chat-proxy.grok.com/v1/{usage,quota,limits,subscription,billing/usage…}`；
-`grok.com/rest/rate-limits` 被 Cloudflare 拦。
+`grok.com/rest/{rate-limits,usage,billing,models}` 全部被 Cloudflare 的 JS 挑战拦掉
+（只有 `/rest/subscriptions` 放行）。
 
-所以插件拼三个真实信号：
+所以插件拼四个真实信号：
 
-1. **限流余量**：`api.x.ai` 每次真实响应的头部
+1. **限流余量百分比**：`api.x.ai` 每次真实响应的头部
    `x-ratelimit-limit-requests` / `-remaining-requests` / `-limit-tokens` / `-remaining-tokens`，
-   通过 `after_provider_response` 钩子被动采集（不额外发请求）。
-2. **套餐与权限**：`cli-chat-proxy.grok.com/v1/settings` 的 `subscription_tier_display`（如 `SuperGrok`）
-   和 `/v1/user` 的 `hasGrokCodeAccess`。
-3. **今日本机用量**：`message_end` 事件里的 `usage` 按天累加（跨会话共享缓存）。
+   通过 `after_provider_response` 钩子被动采集（不额外发请求），换算成 `剩余 / 上限` 的百分比。
+   **实测这是吞吐上限而不是额度**：连打 4 次小请求，余量在 ~60–85 秒内回满
+   （8300 请求 / 53.00M tokens 每分钟级别），所以它几乎总是 100%。
+2. **套餐与本周期**：`grok.com/rest/subscriptions`（需要浏览器 UA 才能过 Cloudflare）返回
+   `dominantPlan.surfaceNames.SURFACE_DISPLAY`（`SuperGrok`）、`dominantPlan.plan`（`supergrok`）、
+   `billingPeriodEnd`、`billingInterval`，所以能显示「本期到 11/24，月付」。
+3. **权限**：`cli-chat-proxy.grok.com/v1/{settings,user}` 的 `subscription_tier_display` 与 `hasGrokCodeAccess`
+   （作为 `/rest/subscriptions` 的兜底）。
+4. **本机用量比例**：`message_end` 事件里的 `usage` 按天累加（跨会话共享缓存），
+   算「今日 Grok 占今日全部用量的百分比」和「近 N 天本机累计」。
 
-**不会**伪造一个"本周还剩 X%"。
+**不会**伪造一个"本周还剩 X%"。状态行里的百分比只在限流余量真的掉到 99.5% 以下时才出现，
+平时只显示套餐名，避免一个恒定的 100% 占位置。
 
 ## 隐私
 
@@ -151,7 +165,8 @@ xAI **没有**公开的订阅剩余额度接口。实测 404 的路径：
 
 1. **pi-web 的扩展 UI 只有文本**：状态行、文本 widget、对话框、`custom()` 文本组件。
    想做带进度环的卡片得改 pi-web 源码（它是预构建的 Next 应用）。
-2. **Grok 没有"本周还剩多少"**：限流窗口很短，计数器会很快回满，只能当瞬时余量看。
+2. **Grok 没有"本周还剩多少"**：只有每分钟级的吞吐上限（实测 ~1 分钟回满），
+   所以报表里给的是「限流余量 %」+「本期本机用量占比」，不是一个额度百分比。
 3. 需要能访问上述域名；走 `HTTP_PROXY` / `HTTPS_PROXY`（pi 自带的 dispatcher 会处理）。
 4. 额度查询失败时保留上次成功的数值并标注「上次刷新失败」，不会清空显示。
 
@@ -181,9 +196,12 @@ report. Set `PI_QUOTA_WIDGET=1` if you want the always-visible detail panel as w
 
 - ChatGPT: 5-hour and 7-day windows with remaining percentage, reset countdown, credits and reset-credit count,
   from `GET https://chatgpt.com/backend-api/wham/usage` (the same free endpoint Codex CLI uses).
-- Grok: xAI exposes **no** subscription-quota endpoint (30+ probed paths return 404), so the plugin shows
-  passive `x-ratelimit-*` headroom collected from real responses, the plan name from the Grok CLI backend,
-  and today's local token usage. No invented percentages.
+- Grok: xAI exposes **no** subscription-quota endpoint (30+ probed paths return 404, and
+  `grok.com/rest/{rate-limits,usage,billing}` sit behind a Cloudflare JS challenge). The plugin therefore shows
+  the real `x-ratelimit-*` headroom from live responses as a percentage, plus the plan and billing period from
+  `grok.com/rest/subscriptions`, plus today's local usage share. Measurements show that headroom is a
+  **per-minute throughput cap** (refills in ~60–85 s), so the numbers are labelled as rate-limit headroom,
+  never as a remaining subscription quota.
 
 ```bash
 pi install git:github.com/pisceslailai/pi-quota-watch

@@ -58,6 +58,10 @@ const WIDGET_ENABLED = process.env.PI_QUOTA_WIDGET === "1";
 const CHATGPT_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const XAI_USER_URL = "https://cli-chat-proxy.grok.com/v1/user";
 const XAI_TIER_URL = "https://cli-chat-proxy.grok.com/v1/settings";
+/** grok.com 的订阅接口：套餐名 + 本期账单结束时间（需浏览器 UA 才能过 Cloudflare） */
+const GROK_SUBSCRIPTIONS_URL = "https://grok.com/rest/subscriptions";
+const BROWSER_UA =
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 const CHATGPT_MIN_INTERVAL_MS = 45_000;
 const XAI_ACCOUNT_MIN_INTERVAL_MS = 6 * 60 * 60_000;
@@ -105,10 +109,14 @@ type XaiState = {
 	headersAt?: number;
 	/** 套餐 / 权限查询时间 */
 	accountAt?: number;
+	/** grok.com 返回的计划 id，例如 supergrok */
+	plan?: string;
+	/** 本期账单结束时间（毫秒） */
+	periodEnd?: number;
+	billingInterval?: string;
 };
 
-type UsageBucket = {
-	day: string;
+type UsageDay = {
 	requests: number;
 	input: number;
 	output: number;
@@ -116,10 +124,13 @@ type UsageBucket = {
 	cacheWrite: number;
 };
 
+const EMPTY_USAGE: UsageDay = { requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+
 type Snapshot = {
 	chatgpt?: ChatgptState;
 	xai?: XaiState;
-	usage?: Record<string, UsageBucket>;
+	/** provider → YYYY-MM-DD → 计数 */
+	usage?: Record<string, Record<string, UsageDay>>;
 	updatedAt?: number;
 };
 
@@ -244,10 +255,42 @@ function cachePath(): string {
 function readCache(): Snapshot {
 	try {
 		const parsed = JSON.parse(readFileSync(cachePath(), "utf8")) as Snapshot;
-		return parsed && typeof parsed === "object" ? parsed : {};
+		if (!parsed || typeof parsed !== "object") return {};
+		parsed.usage = migrateUsage(parsed.usage as unknown);
+		return parsed;
 	} catch {
 		return {};
 	}
+}
+
+function toUsageDay(raw: Record<string, unknown>): UsageDay {
+	return {
+		requests: num(raw.requests) ?? 0,
+		input: num(raw.input) ?? 0,
+		output: num(raw.output) ?? 0,
+		cacheRead: num(raw.cacheRead) ?? 0,
+		cacheWrite: num(raw.cacheWrite) ?? 0,
+	};
+}
+
+/** 兼容 v0.1.x 的单日 bucket 格式：{ provider: { day, requests, … } } */
+function migrateUsage(raw: unknown): Record<string, Record<string, UsageDay>> | undefined {
+	if (!raw || typeof raw !== "object") return undefined;
+	const out: Record<string, Record<string, UsageDay>> = {};
+	for (const [provider, value] of Object.entries(raw as Record<string, unknown>)) {
+		if (!value || typeof value !== "object") continue;
+		const entry = value as Record<string, unknown>;
+		if (typeof entry.day === "string") {
+			out[provider] = { [entry.day]: toUsageDay(entry) };
+			continue;
+		}
+		const days: Record<string, UsageDay> = {};
+		for (const [day, dayValue] of Object.entries(entry)) {
+			if (dayValue && typeof dayValue === "object") days[day] = toUsageDay(dayValue as Record<string, unknown>);
+		}
+		if (Object.keys(days).length > 0) out[provider] = days;
+	}
+	return Object.keys(out).length > 0 ? out : undefined;
 }
 
 function writeCache(snapshot: Snapshot): void {
@@ -369,6 +412,32 @@ async function fetchXaiAccount(ctx: ExtensionContext): Promise<Partial<XaiState>
 		debug("xai settings failed", errorMessage(error));
 	}
 
+	// grok.com 的订阅信息：套餐显示名 + 本期账单结束时间
+	try {
+		const subs = await getJson(GROK_SUBSCRIPTIONS_URL, {
+			Authorization: `Bearer ${token}`,
+			Accept: "application/json",
+			Origin: "https://grok.com",
+			Referer: "https://grok.com/",
+			"User-Agent": BROWSER_UA,
+		});
+		if (subs.status === 200 && subs.json && typeof subs.json === "object") {
+			const body = subs.json as Record<string, any>;
+			const display = body.dominantPlan?.surfaceNames?.SURFACE_DISPLAY;
+			const plan = body.dominantPlan?.plan;
+			if (typeof display === "string" && display.length > 0) patch.tier = display;
+			if (typeof plan === "string" && plan.length > 0) patch.plan = plan;
+
+			const first = Array.isArray(body.subscriptions) ? body.subscriptions[0] : undefined;
+			const periodEnd = typeof first?.billingPeriodEnd === "string" ? Date.parse(first.billingPeriodEnd) : NaN;
+			if (Number.isFinite(periodEnd)) patch.periodEnd = periodEnd;
+			const interval = typeof first?.billingInterval === "string" ? first.billingInterval : undefined;
+			if (interval) patch.billingInterval = interval.replace(/^BILLING_INTERVAL_/, "").toLowerCase();
+		}
+	} catch (error) {
+		debug("grok subscriptions failed", errorMessage(error));
+	}
+
 	return patch;
 }
 
@@ -415,10 +484,63 @@ function windowLine(window: QuotaWindow, width = 10): string {
 	return `  ${left} ${bar(remaining, width)} ${label}   ${tail}`;
 }
 
-function usageToday(snapshot: Snapshot, provider: string): UsageBucket | undefined {
-	const bucket = snapshot.usage?.[provider];
-	if (!bucket || bucket.day !== localDay()) return undefined;
-	return bucket;
+function usageToday(snapshot: Snapshot, provider: string): UsageDay {
+	return snapshot.usage?.[provider]?.[localDay()] ?? EMPTY_USAGE;
+}
+
+function tokensOf(bucket: UsageDay): number {
+	return bucket.input + bucket.output;
+}
+
+/** 最近 N 天（含今天）的本机用量 */
+function usageRecent(snapshot: Snapshot, provider: string, days: number): { total: UsageDay; dayCount: number } {
+	const buckets = snapshot.usage?.[provider];
+	if (!buckets) return { total: EMPTY_USAGE, dayCount: 0 };
+	const cutoff = localDay(Date.now() - (days - 1) * 86_400_000);
+	const total: UsageDay = { ...EMPTY_USAGE };
+	let dayCount = 0;
+	for (const [day, bucket] of Object.entries(buckets)) {
+		if (day < cutoff) continue;
+		dayCount += 1;
+		total.requests += bucket.requests;
+		total.input += bucket.input;
+		total.output += bucket.output;
+		total.cacheRead += bucket.cacheRead;
+		total.cacheWrite += bucket.cacheWrite;
+	}
+	return { total, dayCount };
+}
+
+/** 今日所有 provider 合计 */
+function usageTodayTotal(snapshot: Snapshot): UsageDay {
+	const total: UsageDay = { ...EMPTY_USAGE };
+	for (const bucket of Object.values(snapshot.usage ?? {})) {
+		const day = bucket[localDay()];
+		if (!day) continue;
+		total.requests += day.requests;
+		total.input += day.input;
+		total.output += day.output;
+		total.cacheRead += day.cacheRead;
+		total.cacheWrite += day.cacheWrite;
+	}
+	return total;
+}
+
+/** 剩余比例（0–100）；缺数据时 undefined */
+function remainingRatio(remaining?: number, limit?: number): number | undefined {
+	if (remaining === undefined || limit === undefined || limit <= 0) return undefined;
+	return Math.max(0, Math.min(100, (remaining / limit) * 100));
+}
+
+function fmtCount(value?: number): string {
+	if (value === undefined || !Number.isFinite(value)) return "—";
+	return Math.round(value).toLocaleString("en-US");
+}
+
+/** part 在 whole 中的百分比，用于「今日占比」 */
+function sharePercent(part: number, whole: number): number | undefined {
+	if (!Number.isFinite(part) || !Number.isFinite(whole) || whole <= 0) return undefined;
+	return Math.max(0, Math.min(100, (part / whole) * 100));
 }
 
 function buildStatus(snapshot: Snapshot): string {
@@ -452,12 +574,13 @@ function buildStatus(snapshot: Snapshot): string {
 
 	const xai = snapshot.xai;
 	const xaiBucket = usageToday(snapshot, XAI_PROVIDER);
-	if (xai || xaiBucket) {
-		const bits = [xai?.tier ?? "Grok"];
-		// 没有 ChatGPT 数据时多给一点信息，否则只留套餐名
-		if (!hasChatgpt && xaiBucket && xaiBucket.requests > 0) {
-			bits.push(`今日 ${fmtTokens(xaiBucket.input + xaiBucket.output)}`);
-		}
+	if (xai || xaiBucket.requests > 0) {
+		const tier = xai?.tier ?? "Grok";
+		// 限流余量百分比只在真的掉下来时才上状态行（平时就是 100%，不上比上干净）
+		const limitPct = remainingRatio(xai?.remainingTokens, xai?.limitTokens);
+		const bits = [limitPct !== undefined && limitPct < 99.5 ? `${tier} ${Math.round(limitPct)}%` : tier];
+		// 没有 ChatGPT 数据时多给一点信息
+		if (!hasChatgpt && xaiBucket.requests > 0) bits.push(`今日 ${fmtTokens(tokensOf(xaiBucket))}`);
 		parts.push(bits.join(" · "));
 	}
 
@@ -485,7 +608,7 @@ function buildPanel(snapshot: Snapshot): string[] {
 			if (extras.length > 0) lines.push(`  ${extras.join(" · ")}`);
 
 			const chatgptBucket = usageToday(snapshot, CHATGPT_PROVIDER);
-			if (chatgptBucket && chatgptBucket.requests > 0) {
+			if (chatgptBucket.requests > 0) {
 				lines.push(
 					`  今日    ${chatgptBucket.requests} 次 · 输入 ${fmtTokens(chatgptBucket.input)} · 输出 ${fmtTokens(chatgptBucket.output)} · 缓存读 ${fmtTokens(chatgptBucket.cacheRead)}`,
 				);
@@ -497,24 +620,29 @@ function buildPanel(snapshot: Snapshot): string[] {
 
 	const xai = snapshot.xai;
 	const xaiBucket = usageToday(snapshot, XAI_PROVIDER);
-	if (xai || xaiBucket) {
+	if (xai || xaiBucket.requests > 0) {
 		const tier = xai?.tier ?? "Grok";
 		const access = xai?.hasGrokCodeAccess === true ? " · Grok Code 可用" : "";
-		lines.push(`${tier}${access}`);
-		if (xai?.remainingRequests !== undefined && xai.limitRequests !== undefined) {
-			const remaining = xai.limitRequests > 0 ? (xai.remainingRequests / xai.limitRequests) * 100 : 0;
-			lines.push(
-				`  限流  ${bar(remaining)} ${Math.round(remaining)}% 剩   ${Math.round(xai.remainingRequests)}/${Math.round(xai.limitRequests)} 请求`,
-			);
+		const period = xai?.periodEnd ? ` · 本期到 ${fmtDate(xai.periodEnd)}` : "";
+		lines.push(`${tier}${access}${period}`);
+
+		const requestPct = remainingRatio(xai?.remainingRequests, xai?.limitRequests);
+		const tokenPct = remainingRatio(xai?.remainingTokens, xai?.limitTokens);
+		if (requestPct !== undefined) {
+			lines.push(`  请求  ${bar(requestPct)} ${Math.round(requestPct)}% 剩   ${fmtCount(xai?.remainingRequests)}/${fmtCount(xai?.limitRequests)}`);
 		}
-		if (xai?.remainingTokens !== undefined && xai.limitTokens !== undefined) {
-			lines.push(`  tokens 剩 ${fmtTokens(xai.remainingTokens)} / ${fmtTokens(xai.limitTokens)}`);
+		if (tokenPct !== undefined) {
+			lines.push(`  tokens ${bar(tokenPct)} ${Math.round(tokenPct)}% 剩   ${fmtTokens(xai?.remainingTokens)}/${fmtTokens(xai?.limitTokens)}`);
 		}
-		if (xai?.headersAt) lines.push(`  （响应头采样 ${fmtClock(xai.headersAt)}，窗口长度未知）`);
-		else lines.push("  发一次 Grok 请求后即可看到限流余量");
-		if (xaiBucket && xaiBucket.requests > 0) {
+		if (requestPct === undefined && tokenPct === undefined) lines.push("  发一次 Grok 请求后即可看到限流余量");
+		else if (xai?.headersAt) lines.push(`  （响应头采样 ${fmtClock(xai.headersAt)}，约 1 分钟滚动）`);
+
+		if (xaiBucket.requests > 0) {
+			const total = tokensOf(usageTodayTotal(snapshot));
+			const share = sharePercent(tokensOf(xaiBucket), total);
+			const shareText = share === undefined ? "" : `（占今日 ${Math.round(share)}%）`;
 			lines.push(
-				`  今日    ${xaiBucket.requests} 次 · 输入 ${fmtTokens(xaiBucket.input)} · 输出 ${fmtTokens(xaiBucket.output)} · 缓存读 ${fmtTokens(xaiBucket.cacheRead)}`,
+				`  今日    ${xaiBucket.requests} 次 · 输入 ${fmtTokens(xaiBucket.input)} · 输出 ${fmtTokens(xaiBucket.output)}${shareText}`,
 			);
 		}
 	}
@@ -525,6 +653,7 @@ function buildPanel(snapshot: Snapshot): string[] {
 
 function buildReport(snapshot: Snapshot): string {
 	const lines: string[] = ["### 订阅额度", ""];
+	const todayTotal = usageTodayTotal(snapshot);
 
 	const chatgpt = snapshot.chatgpt;
 	if (chatgpt?.ok) {
@@ -548,9 +677,11 @@ function buildReport(snapshot: Snapshot): string {
 		if (chatgpt.models) extras.push(`可用模型：${Object.keys(chatgpt.models).join(", ")}`);
 		if (extras.length > 0) lines.push(extras.join(" · "));
 		const chatgptBucket = usageToday(snapshot, CHATGPT_PROVIDER);
-		if (chatgptBucket && chatgptBucket.requests > 0) {
+		if (chatgptBucket.requests > 0) {
+			const share = sharePercent(tokensOf(chatgptBucket), tokensOf(todayTotal));
+			const shareText = share === undefined ? "" : `（占今日 ${Math.round(share)}%）`;
 			lines.push(
-				`今日本机用量：${chatgptBucket.requests} 次 · 输入 ${fmtTokens(chatgptBucket.input)} · 输出 ${fmtTokens(chatgptBucket.output)} · 缓存读 ${fmtTokens(chatgptBucket.cacheRead)}`,
+				`今日本机用量：${chatgptBucket.requests} 次 · 输入 ${fmtTokens(chatgptBucket.input)} · 输出 ${fmtTokens(chatgptBucket.output)} · 缓存读 ${fmtTokens(chatgptBucket.cacheRead)} ${shareText}`,
 			);
 		}
 	} else if (chatgpt) {
@@ -559,23 +690,51 @@ function buildReport(snapshot: Snapshot): string {
 
 	const xai = snapshot.xai;
 	const xaiBucket = usageToday(snapshot, XAI_PROVIDER);
-	if (xai || xaiBucket) {
+	if (xai || xaiBucket.requests > 0) {
 		lines.push("");
-		lines.push(`**Grok**${xai?.tier ? ` · ${xai.tier}` : ""}${xai?.hasGrokCodeAccess ? " · Grok Code 可用" : ""}`);
+		const period = xai?.periodEnd
+			? `　（本期到 ${fmtDate(xai.periodEnd)}${xai.billingInterval === "monthly" ? "\uff0c月付" : ""}）`
+			: "";
+		lines.push(`**Grok**${xai?.tier ? ` · ${xai.tier}` : ""}${xai?.hasGrokCodeAccess ? " · Grok Code 可用" : ""}${period}`);
+
+		const requestPct = remainingRatio(xai?.remainingRequests, xai?.limitRequests);
+		const tokenPct = remainingRatio(xai?.remainingTokens, xai?.limitTokens);
 		lines.push("");
-		if (xai?.remainingRequests !== undefined && xai.limitRequests !== undefined) {
-			lines.push(
-				`- 限流余量：${Math.round(xai.remainingRequests)}/${Math.round(xai.limitRequests)} 请求，${fmtTokens(xai.remainingTokens)}/${fmtTokens(xai.limitTokens)} tokens（${fmtClock(xai.headersAt)} 采样，窗口长度未知）`,
-			);
+		if (requestPct !== undefined || tokenPct !== undefined) {
+			lines.push("| 维度 | 剩余 | 上限 | 采样 |");
+			lines.push("| --- | --- | --- | --- |");
+			if (requestPct !== undefined) {
+				lines.push(
+					`| 请求 | \`${bar(requestPct, 8)}\` ${Math.round(requestPct)}% | ${fmtCount(xai?.limitRequests)} | ${fmtClock(xai?.headersAt)} |`,
+				);
+			}
+			if (tokenPct !== undefined) {
+				lines.push(
+					`| tokens | \`${bar(tokenPct, 8)}\` ${Math.round(tokenPct)}% | ${fmtTokens(xai?.limitTokens)} | ${fmtClock(xai?.headersAt)} |`,
+				);
+			}
 		} else {
-			lines.push("- 限流余量：暂无数据（用 Grok 发一次请求后自动采集响应头）");
+			lines.push("限流余量：暂无数据（用 Grok 发一次请求后自动采集响应头）");
 		}
-		if (xaiBucket && xaiBucket.requests > 0) {
+
+		if (xaiBucket.requests > 0) {
+			const share = sharePercent(tokensOf(xaiBucket), tokensOf(todayTotal));
+			const shareText = share === undefined ? "" : `（占今日 ${Math.round(share)}%）`;
+			lines.push("");
 			lines.push(
-				`- 今日本机用量：${xaiBucket.requests} 次请求 · 输入 ${fmtTokens(xaiBucket.input)} · 输出 ${fmtTokens(xaiBucket.output)} · 缓存读 ${fmtTokens(xaiBucket.cacheRead)}`,
+				`- 今日本机用量：${xaiBucket.requests} 次 · 输入 ${fmtTokens(xaiBucket.input)} · 输出 ${fmtTokens(xaiBucket.output)} · 缓存读 ${fmtTokens(xaiBucket.cacheRead)} ${shareText}`,
 			);
+			const recent = usageRecent(snapshot, XAI_PROVIDER, 7);
+			if (recent.dayCount > 1) {
+				lines.push(
+					`- 近 ${recent.dayCount} 天本机累计：${recent.total.requests} 次 · ${fmtTokens(tokensOf(recent.total))} tokens`,
+				);
+			}
 		}
-		lines.push("- 说明：xAI 没有公开的订阅剩余额度接口，这里给的是限流余量 + 本机用量。");
+
+		lines.push("");
+		lines.push("- ⚠ 上表的 % 是**限流余量**（xAI 只暴露吞吐上限，实测约 1 分钟内回满），不是「本期还剩多少」——xAI 没有这种接口。");
+		lines.push("- 能反映实际使用的只有本机统计，所以额外给了「占今日」比例。");
 	}
 
 	if (lines.length <= 2) {
@@ -600,7 +759,7 @@ export default function quotaWatch(pi: ExtensionAPI) {
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let inflight: Promise<void> | undefined;
 	let disposed = false;
-	let pendingUsage = new Map<string, UsageBucket>();
+	let pendingUsage = new Map<string, UsageDay>();
 	let pendingFlush: ReturnType<typeof setTimeout> | undefined;
 
 	const render = (ctx: ExtensionContext): void => {
@@ -631,22 +790,19 @@ export default function quotaWatch(pi: ExtensionAPI) {
 		if (pendingUsage.size === 0) return;
 
 		const latest = readCache();
-		const usage: Record<string, UsageBucket> = { ...(latest.usage ?? {}) };
+		const usage: Record<string, Record<string, UsageDay>> = { ...(latest.usage ?? {}) };
 		const today = localDay();
 		for (const [provider, delta] of pendingUsage) {
-			const current = usage[provider];
-			const base: UsageBucket =
-				current && current.day === today
-					? current
-					: { day: today, requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-			usage[provider] = {
-				day: today,
+			const days = { ...(usage[provider] ?? {}) };
+			const base = days[today] ?? EMPTY_USAGE;
+			days[today] = {
 				requests: base.requests + delta.requests,
 				input: base.input + delta.input,
 				output: base.output + delta.output,
 				cacheRead: base.cacheRead + delta.cacheRead,
 				cacheWrite: base.cacheWrite + delta.cacheWrite,
 			};
+			usage[provider] = days;
 		}
 		pendingUsage = new Map();
 
@@ -662,14 +818,13 @@ export default function quotaWatch(pi: ExtensionAPI) {
 	};
 
 	const recordUsage = (provider: string, usage: Record<string, unknown>): void => {
-		const previous = pendingUsage.get(provider);
+		const previous = pendingUsage.get(provider) ?? EMPTY_USAGE;
 		pendingUsage.set(provider, {
-			day: localDay(),
-			requests: (previous?.requests ?? 0) + 1,
-			input: (previous?.input ?? 0) + (num(usage.input) ?? 0),
-			output: (previous?.output ?? 0) + (num(usage.output) ?? 0),
-			cacheRead: (previous?.cacheRead ?? 0) + (num(usage.cacheRead) ?? 0),
-			cacheWrite: (previous?.cacheWrite ?? 0) + (num(usage.cacheWrite) ?? 0),
+			requests: previous.requests + 1,
+			input: previous.input + (num(usage.input) ?? 0),
+			output: previous.output + (num(usage.output) ?? 0),
+			cacheRead: previous.cacheRead + (num(usage.cacheRead) ?? 0),
+			cacheWrite: previous.cacheWrite + (num(usage.cacheWrite) ?? 0),
 		});
 		scheduleFlush();
 	};
