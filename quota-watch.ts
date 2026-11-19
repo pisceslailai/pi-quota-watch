@@ -176,6 +176,14 @@ function fmtDuration(seconds?: number): string {
 	return `${m}m`;
 }
 
+/** 采样时间距今多久：“刚刚” / “1h21m 前” */
+function fmtAge(ts?: number): string {
+	if (!ts) return "";
+	const seconds = (Date.now() - ts) / 1000;
+	if (seconds < 60) return "刚刚";
+	return `${fmtDurationShort(seconds)} 前`;
+}
+
 /** 状态行用的紧凑写法：1d4h / 3h20m / 45m */
 function fmtDurationShort(seconds?: number): string {
 	if (seconds === undefined || !Number.isFinite(seconds) || seconds < 0) return "—";
@@ -428,7 +436,10 @@ async function fetchXaiAccount(ctx: ExtensionContext): Promise<Partial<XaiState>
 			if (typeof display === "string" && display.length > 0) patch.tier = display;
 			if (typeof plan === "string" && plan.length > 0) patch.plan = plan;
 
-			const first = Array.isArray(body.subscriptions) ? body.subscriptions[0] : undefined;
+			// 列表里可能同时有 INACTIVE 的旧订阅，取 ACTIVE 那条
+			const list = Array.isArray(body.subscriptions) ? body.subscriptions : [];
+			const first =
+				list.find((item: Record<string, unknown>) => item?.status === "SUBSCRIPTION_STATUS_ACTIVE") ?? list[0];
 			const periodEnd = typeof first?.billingPeriodEnd === "string" ? Date.parse(first.billingPeriodEnd) : NaN;
 			if (Number.isFinite(periodEnd)) patch.periodEnd = periodEnd;
 			const interval = typeof first?.billingInterval === "string" ? first.billingInterval : undefined;
@@ -452,21 +463,26 @@ function readRateLimitHeaders(rawHeaders: unknown): Partial<XaiState> | undefine
 		}
 	}
 
-	const patch: Partial<XaiState> = {
-		limitRequests: num(lower["x-ratelimit-limit-requests"]),
-		remainingRequests: num(lower["x-ratelimit-remaining-requests"]),
-		limitTokens: num(lower["x-ratelimit-limit-tokens"]),
-		remainingTokens: num(lower["x-ratelimit-remaining-tokens"]),
-	};
+	const patch: Partial<XaiState> = {};
+	const fields: Array<keyof XaiState> = [
+		"limitRequests",
+		"remainingRequests",
+		"limitTokens",
+		"remainingTokens",
+	];
+	const headerNames = [
+		"x-ratelimit-limit-requests",
+		"x-ratelimit-remaining-requests",
+		"x-ratelimit-limit-tokens",
+		"x-ratelimit-remaining-tokens",
+	];
+	fields.forEach((field, index) => {
+		const value = num(lower[headerNames[index]!]);
+		// 只写真正拿到的字段，避免用 undefined 抹掉缓存里的旧值
+		if (value !== undefined) (patch as Record<string, number>)[field] = value;
+	});
 
-	if (
-		patch.limitRequests === undefined &&
-		patch.remainingRequests === undefined &&
-		patch.limitTokens === undefined &&
-		patch.remainingTokens === undefined
-	) {
-		return undefined;
-	}
+	if (Object.keys(patch).length === 0) return undefined;
 
 	patch.headersAt = Date.now();
 	return patch;
@@ -635,7 +651,11 @@ function buildPanel(snapshot: Snapshot): string[] {
 			lines.push(`  tokens ${bar(tokenPct)} ${Math.round(tokenPct)}% 剩   ${fmtTokens(xai?.remainingTokens)}/${fmtTokens(xai?.limitTokens)}`);
 		}
 		if (requestPct === undefined && tokenPct === undefined) lines.push("  发一次 Grok 请求后即可看到限流余量");
-		else if (xai?.headersAt) lines.push(`  （响应头采样 ${fmtClock(xai.headersAt)}，约 1 分钟滚动）`);
+		else if (xai?.headersAt) {
+			lines.push(
+				`  （响应头采样 ${fmtClock(xai.headersAt)} · ${fmtAge(xai.headersAt)}，约 1 分钟滚动）`,
+			);
+		}
 
 		if (xaiBucket.requests > 0) {
 			const total = tokensOf(usageTodayTotal(snapshot));
@@ -681,7 +701,7 @@ function buildReport(snapshot: Snapshot): string {
 			const share = sharePercent(tokensOf(chatgptBucket), tokensOf(todayTotal));
 			const shareText = share === undefined ? "" : `（占今日 ${Math.round(share)}%）`;
 			lines.push(
-				`今日本机用量：${chatgptBucket.requests} 次 · 输入 ${fmtTokens(chatgptBucket.input)} · 输出 ${fmtTokens(chatgptBucket.output)} · 缓存读 ${fmtTokens(chatgptBucket.cacheRead)} ${shareText}`,
+				`今日本机用量：${chatgptBucket.requests} 次 · 输入 ${fmtTokens(chatgptBucket.input)} · 输出 ${fmtTokens(chatgptBucket.output)} · 缓存读 ${fmtTokens(chatgptBucket.cacheRead)}${shareText}`,
 			);
 		}
 	} else if (chatgpt) {
@@ -703,14 +723,15 @@ function buildReport(snapshot: Snapshot): string {
 		if (requestPct !== undefined || tokenPct !== undefined) {
 			lines.push("| 维度 | 剩余 | 上限 | 采样 |");
 			lines.push("| --- | --- | --- | --- |");
+			const sampleAge = xai?.headersAt ? ` · ${fmtAge(xai.headersAt)}` : "";
 			if (requestPct !== undefined) {
 				lines.push(
-					`| 请求 | \`${bar(requestPct, 8)}\` ${Math.round(requestPct)}% | ${fmtCount(xai?.limitRequests)} | ${fmtClock(xai?.headersAt)} |`,
+					`| 请求 | \`${bar(requestPct, 8)}\` ${Math.round(requestPct)}% | ${fmtCount(xai?.limitRequests)} | ${fmtClock(xai?.headersAt)}${sampleAge} |`,
 				);
 			}
 			if (tokenPct !== undefined) {
 				lines.push(
-					`| tokens | \`${bar(tokenPct, 8)}\` ${Math.round(tokenPct)}% | ${fmtTokens(xai?.limitTokens)} | ${fmtClock(xai?.headersAt)} |`,
+					`| tokens | \`${bar(tokenPct, 8)}\` ${Math.round(tokenPct)}% | ${fmtTokens(xai?.limitTokens)} | ${fmtClock(xai?.headersAt)}${sampleAge} |`,
 				);
 			}
 		} else {
@@ -722,7 +743,7 @@ function buildReport(snapshot: Snapshot): string {
 			const shareText = share === undefined ? "" : `（占今日 ${Math.round(share)}%）`;
 			lines.push("");
 			lines.push(
-				`- 今日本机用量：${xaiBucket.requests} 次 · 输入 ${fmtTokens(xaiBucket.input)} · 输出 ${fmtTokens(xaiBucket.output)} · 缓存读 ${fmtTokens(xaiBucket.cacheRead)} ${shareText}`,
+				`- 今日本机用量：${xaiBucket.requests} 次 · 输入 ${fmtTokens(xaiBucket.input)} · 输出 ${fmtTokens(xaiBucket.output)} · 缓存读 ${fmtTokens(xaiBucket.cacheRead)}${shareText}`,
 			);
 			const recent = usageRecent(snapshot, XAI_PROVIDER, 7);
 			if (recent.dayCount > 1) {
@@ -761,6 +782,32 @@ export default function quotaWatch(pi: ExtensionAPI) {
 	let disposed = false;
 	let pendingUsage = new Map<string, UsageDay>();
 	let pendingFlush: ReturnType<typeof setTimeout> | undefined;
+
+	/**
+	 * pi-web 一个进程里会跑多个会话（每个会话一份本插件的闭包），而额度缓存是共享文件。
+	 * 合并时按块取「更新鲜」的那个，否则旧内存会把别的会话刚写到磁盘的新数据冲掉。
+	 */
+	const mergeWithDisk = (): Snapshot => {
+		const disk = readCache();
+		const fresher = <T extends object>(a: T | undefined, b: T | undefined, stamp: (value: T | undefined) => number): T | undefined => {
+			if (!a) return b;
+			if (!b) return a;
+			return stamp(a) >= stamp(b) ? { ...b, ...a } : { ...a, ...b };
+		};
+		return {
+			...snapshot,
+			...disk,
+			chatgpt: fresher(disk.chatgpt, snapshot.chatgpt, (state) => state?.fetchedAt ?? 0),
+			xai: fresher(
+				disk.xai,
+				snapshot.xai,
+				(state) => Math.max(state?.accountAt ?? 0, state?.headersAt ?? 0),
+			),
+			// 用量以磁盘为准：本进程未落盘的部分在 pendingUsage 里
+			usage: disk.usage ?? snapshot.usage,
+			updatedAt: Date.now(),
+		};
+	};
 
 	const render = (ctx: ExtensionContext): void => {
 		if (disposed) return;
@@ -806,7 +853,7 @@ export default function quotaWatch(pi: ExtensionAPI) {
 		}
 		pendingUsage = new Map();
 
-		snapshot = { ...snapshot, usage, updatedAt: Date.now() };
+		snapshot = { ...mergeWithDisk(), usage, updatedAt: Date.now() };
 		writeCache(snapshot);
 		if (sessionCtx) render(sessionCtx);
 	};
@@ -835,7 +882,7 @@ export default function quotaWatch(pi: ExtensionAPI) {
 
 		inflight = (async () => {
 			const now = Date.now();
-			snapshot = { ...readCache(), ...snapshot };
+			snapshot = mergeWithDisk();
 			const patch: Partial<Snapshot> = {};
 
 			const chatgptDue =
@@ -975,7 +1022,8 @@ export default function quotaWatch(pi: ExtensionAPI) {
 		if (ctx.model?.provider !== XAI_PROVIDER) return;
 		const patch = readRateLimitHeaders(event.headers);
 		if (!patch) return;
-		snapshot = { ...snapshot, xai: { ...(snapshot.xai ?? {}), ...patch }, updatedAt: Date.now() };
+		const merged = mergeWithDisk();
+		snapshot = { ...merged, xai: { ...(merged.xai ?? {}), ...patch }, updatedAt: Date.now() };
 		writeCache(snapshot);
 		render(ctx);
 	});

@@ -22,7 +22,7 @@
 
 credits：0 · 重置券：3 张 · 可用模型：gpt-6-astra
 
-**Grok** · SuperGrok · Grok Code 可用　（本期到 11/24 23:21，月付）
+**Grok** · SuperGrok · Grok Code 可用　（本期到 12/19 15:27，月付）
 
 | 维度 | 剩余 | 上限 | 采样 |
 | --- | --- | --- | --- |
@@ -146,7 +146,7 @@ xAI **没有**「本期还剩多少」这种额度接口。实测 404 的路径�
    （8300 请求 / 53.00M tokens 每分钟级别），所以它几乎总是 100%。
 2. **套餐与本周期**：`grok.com/rest/subscriptions`（需要浏览器 UA 才能过 Cloudflare）返回
    `dominantPlan.surfaceNames.SURFACE_DISPLAY`（`SuperGrok`）、`dominantPlan.plan`（`supergrok`）、
-   `billingPeriodEnd`、`billingInterval`，所以能显示「本期到 11/24，月付」。
+   `billingPeriodEnd`、`billingInterval`，所以能显示「本期到 12/19，月付」（列表里有 INACTIVE 的旧周期时取 ACTIVE 那条）。
 3. **权限**：`cli-chat-proxy.grok.com/v1/{settings,user}` 的 `subscription_tier_display` 与 `hasGrokCodeAccess`
    （作为 `/rest/subscriptions` 的兜底）。
 4. **本机用量比例**：`message_end` 事件里的 `usage` 按天累加（跨会话共享缓存），
