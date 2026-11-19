@@ -1,0 +1,60 @@
+{
+  "name": "pi-quota-watch",
+  "version": "0.1.0",
+  "description": "Show ChatGPT (Codex) and Grok (xAI) subscription quota inside pi and pi-web: 5h/7d usage windows, reset countdown, credits, rate-limit headroom",
+  "type": "module",
+  "license": "MIT",
+  "author": {
+    "name": "pisceslailai",
+    "url": "https://github.com/pisceslailai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pisceslailai/pi-quota-watch.git"
+  },
+  "homepage": "https://github.com/pisceslailai/pi-quota-watch",
+  "bugs": {
+    "url": "https://github.com/pisceslailai/pi-quota-watch/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "pi-web",
+    "extension",
+    "quota",
+    "usage",
+    "subscription",
+    "chatgpt",
+    "codex",
+    "openai",
+    "grok",
+    "xai"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": [
+    "quota-watch.ts",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./quota-watch.ts"
+    ],
+    "changelogPath": "./CHANGELOG.md"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=1.0.0"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.5.2",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
+  }
+}
